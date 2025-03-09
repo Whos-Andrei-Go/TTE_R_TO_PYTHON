@@ -17,6 +17,7 @@ from .te_stats_glm_logit import TEStatsGLMLogit
 from .calculate_weights import calculate_weights_trial_seq
 
 
+
 @dataclass
 class TrialSequence:
     """Base class for trial sequence"""
