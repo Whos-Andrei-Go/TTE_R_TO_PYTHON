@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import pandas as pd
 import numpy as np
@@ -16,6 +16,8 @@ from .te_outcome_model import TEOutcomeModel, TEOutcomeModelUnset
 from .censor_func import censor_func
 from .te_stats_glm_logit import TEStatsGLMLogit
 from .calculate_weights import calculate_weights_trial_seq
+from .expand_trials import ExpandTrials
+from .utils import as_formula
 
 
 
@@ -158,43 +160,47 @@ class TrialSequence:
 
         return self
 
-    def set_outcome_model(self, treatment_var="0", adjustment_terms="",  # Change default to empty string
-                        followup_time_terms="followup_time + np.power(followup_time, 2)",
-                        trial_period_terms="trial_period + np.power(trial_period, 2)",
-                        model_fitter=None):
-        if self.data is None:
+    def set_outcome_model(self, 
+                      treatment_var: str = "~0", 
+                      adjustment_terms: str = "~1", 
+                      followup_time_terms: str = "~ followup_time + (followup_time ** 2)", 
+                      trial_period_terms: str = "~ trial_period + (trial_period ** 2)", 
+                      model_fitter=None):
+        if self.data is None or self.data.empty:
             raise ValueError("Use set_data() before set_outcome_model()")
 
         # Create formulas
-        formulas = {
-            "treatment": treatment_var,
-            "adjustment": adjustment_terms,
-            "followup": followup_time_terms,
-            "period": trial_period_terms,
-            "stabilised": self.get_stabilised_weights_terms()  # Ensure this returns variable names
+        formula_list = {
+            "treatment": as_formula(treatment_var),
+            "adjustment": as_formula(adjustment_terms),
+            "followup": as_formula(followup_time_terms),
+            "period": as_formula(trial_period_terms),
+            "stabilised": self.get_stabilised_weights_terms()  # Placeholder for actual implementation
         }
 
         # Collect adjustment variables
-        # Split by '+' and strip whitespace, then filter out any non-variable names
-        adjustment_vars = set(var.strip() for var in formulas["adjustment"].split("+")) | \
-                        set(var.strip() for var in formulas["stabilised"].split("+"))
+        adjustment = list(set(pd.Series(formula_list["adjustment"]).str.split('+').explode().str.strip().tolist() +
+                              pd.Series(formula_list["stabilised"]).str.split('+').explode().str.strip().tolist()))
 
-        # Validate variables exist in data
-        missing_vars = [var for var in adjustment_vars if var not in self.data.columns and var != '']
-        if missing_vars:
-            raise ValueError(f"Missing variables in adjustment terms: {missing_vars}")
+        # # Validate variables exist in data
+        # missing_vars = [var for var in adjustment if var not in self.data.columns]
+        # if missing_vars:
+        #     raise ValueError(f"Missing variables in adjustment terms: {missing_vars}")
 
-        self.outcome_model = {
-            "treatment_var": formulas["treatment"],
-            "adjustment_vars": adjustment_vars,
-            "model_fitter": model_fitter or LogisticRegression(),
-            "adjustment_terms": formulas["adjustment"],
-            "treatment_terms": formulas["treatment"],
-            "followup_time_terms": formulas["followup"],
-            "trial_period_terms": formulas["period"],
-            "stabilised_weights_terms": formulas["stabilised"]
-        }
+        # Create the outcome model
+        self.outcome_model = TEOutcomeModel(
+            formula=formula_list["treatment"],
+            adjustment_vars=adjustment,
+            treatment_var=treatment_var,
+            adjustment_terms=formula_list["adjustment"],
+            treatment_terms=formula_list["treatment"],
+            followup_time_terms=formula_list["followup"],
+            trial_period_terms=formula_list["period"],
+            stabilised_weights_terms=formula_list["stabilised"],
+            model_fitter=model_fitter or TEStatsGLMLogit  # Use a default model fitter if none is provided
+        )
 
+        # Update the outcome formula
         self.update_outcome_formula()
 
     def get_stabilised_weights_terms(self):
@@ -294,6 +300,64 @@ class TrialSequence:
             censor_at_switch=censor_at_switch
         )
         return self
+
+    def load_expanded_data(self, p_control: Optional[float] = None, 
+                           period: Optional[int] = None, 
+                           subset_condition: Optional[str] = None, 
+                           seed: Optional[int] = None):
+        # Check that the datastore has been initialized and has data
+        if self.expansion is None or self.expansion.datastore is None:
+            raise ValueError("Expansion datastore is not initialized.")
+
+        if not hasattr(self.expansion.datastore, 'N') or self.expansion.datastore.N <= 0:
+            raise ValueError("Datastore must have a positive count of N.")
+
+        if p_control is not None:
+            if not (0 <= p_control <= 1):
+                raise ValueError("p_control must be between 0 and 1.")
+
+        if period is not None:
+            if not isinstance(period, int) or period < 0:
+                raise ValueError("period must be a non-negative integer.")
+
+        if subset_condition is not None:
+            if not isinstance(subset_condition, str):
+                raise ValueError("subset_condition must be a string.")
+
+        if seed is not None:
+            if not isinstance(seed, int):
+                raise ValueError("seed must be an integer.")
+
+        # Set the random seed if provided
+        if seed is not None:
+            np.random.seed(seed)
+
+        # Load data based on p_control
+        if p_control is None:
+            data_table = self.read_expanded_data(period=period, subset_condition=subset_condition)
+            data_table['sample_weight'] = 1
+        else:
+            data_table = self.sample_expanded_data(
+                period=period,
+                subset_condition=subset_condition,
+                p_control=p_control,
+                seed=seed
+            )
+
+        # Assuming te_outcome_data is a function that processes the data_table
+        self.outcome_data = self.te_outcome_data(data_table, p_control, subset_condition)
+
+        return self
+
+    def read_expanded_data(self, period, subset_condition):
+        # Placeholder for the actual implementation of reading expanded data
+        # This should return a DataFrame based on the period and subset_condition
+        return pd.DataFrame()  # Replace with actual data loading logic
+
+    def sample_expanded_data(self, period, subset_condition, p_control, seed):
+        # Placeholder for the actual implementation of sampling expanded data
+        # This should return a sampled DataFrame based on the parameters
+        return pd.DataFrame()  # Replace with actual sampling logic
 
     def predict(self, newdata, predict_times, conf_int=True, samples=100, type='survival'):
         # Placeholder for the actual prediction logic
