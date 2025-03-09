@@ -1,5 +1,6 @@
 import pandas as pd
 import statsmodels.api as sm
+import numpy as np
 
 from custom_modules.trialemulation.te_data import TEDataUnset
 
@@ -8,12 +9,26 @@ class TEWeightsFitted:
     def __init__(self, label, summary=None, fitted=None):
         self.label = label
         self.summary = summary if summary else {}
-        self.fitted = fitted if fitted else {}
-
+        
+        # Ensure fitted is either a pandas Series or array-like object, not a dict
+        if fitted is None:
+            self.fitted = None
+        elif isinstance(fitted, (np.ndarray, pd.Series)):
+            self.fitted = fitted
+        else:
+            raise ValueError("Fitted values must be a pandas Series or numpy ndarray.")
+    
     def show(self):
         print(f"Model: {self.label}")
         for key, df in self.summary.items():
             print(f"Summary [{key}]:\n", df)
+        
+        # Show fitted values if available
+        if self.fitted is not None:
+            print(f"Fitted values:\n", self.fitted)
+        else:
+            print("No fitted values available.")
+
 
 class TEWeightsSpec:
     """Weight specification"""

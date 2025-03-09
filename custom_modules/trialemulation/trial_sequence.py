@@ -6,6 +6,7 @@ import numpy as np
 from patsy import dmatrices
 from sklearn.linear_model import LogisticRegression
 
+from .te_datastore import TEDatastore, TEDatastoreDataTable
 from .te_data import TEData, TEDataUnset, TEOutcomeData
 from .data_manipulation import data_manipulation
 from .te_weights import TEWeightsSpec, TEWeightsUnset, TEWeightsFitted
@@ -13,7 +14,8 @@ from .te_expansion import TEExpansion, TEExpansionUnset
 from .te_outcome_model import TEOutcomeModel, TEOutcomeModelUnset
 from .censor_func import censor_func
 from .te_stats_glm_logit import TEStatsGLMLogit
-# from .calculate_weights import CalculaTEWeights
+from .calculate_weights import calculate_weights_trial_seq
+
 
 @dataclass
 class TrialSequence:
@@ -91,6 +93,10 @@ class TrialSequence:
         if pool_models not in ["none", "both", "numerator"]:
             raise ValueError("pool_models must be one of: 'none', 'both', 'numerator'")
 
+        # Remove leading tilde if present
+        numerator = numerator.lstrip('~').strip()
+        denominator = denominator.lstrip('~').strip()
+
         # Modify formulas
         numerator_formula = f"(1 - {censor_event}) ~ {numerator}"
         denominator_formula = f"(1 - {censor_event}) ~ {denominator}"
@@ -150,10 +156,10 @@ class TrialSequence:
 
         return self
 
-    def set_outcome_model(self, treatment_var="0", adjustment_terms="1",
-                          followup_time_terms="followup_time + np.power(followup_time, 2)",
-                          trial_period_terms="trial_period + np.power(trial_period, 2)",
-                          model_fitter=None):
+    def set_outcome_model(self, treatment_var="0", adjustment_terms="",  # Change default to empty string
+                        followup_time_terms="followup_time + np.power(followup_time, 2)",
+                        trial_period_terms="trial_period + np.power(trial_period, 2)",
+                        model_fitter=None):
         if self.data is None:
             raise ValueError("Use set_data() before set_outcome_model()")
 
@@ -163,14 +169,16 @@ class TrialSequence:
             "adjustment": adjustment_terms,
             "followup": followup_time_terms,
             "period": trial_period_terms,
-            "stabilised": self.get_stabilised_weights_terms()
+            "stabilised": self.get_stabilised_weights_terms()  # Ensure this returns variable names
         }
 
         # Collect adjustment variables
-        adjustment_vars = set(formulas["adjustment"].split(" + ")) | set(formulas["stabilised"].split(" + "))
+        # Split by '+' and strip whitespace, then filter out any non-variable names
+        adjustment_vars = set(var.strip() for var in formulas["adjustment"].split("+")) | \
+                        set(var.strip() for var in formulas["stabilised"].split("+"))
 
         # Validate variables exist in data
-        missing_vars = [var for var in adjustment_vars if var not in self.data.columns]
+        missing_vars = [var for var in adjustment_vars if var not in self.data.columns and var != '']
         if missing_vars:
             raise ValueError(f"Missing variables in adjustment terms: {missing_vars}")
 
@@ -188,15 +196,20 @@ class TrialSequence:
         self.update_outcome_formula()
 
     def get_stabilised_weights_terms(self):
-        stabilised_terms = "1"
+        stabilised_terms = []
 
         if hasattr(self, "censor_weights") and self.censor_weights:
-            stabilised_terms += f" + {self.censor_weights}"
+            # Assuming censor_weights has attributes for numerator and denominator
+            stabilised_terms.append(self.censor_weights.numerator)
+            stabilised_terms.append(self.censor_weights.denominator)
 
         if hasattr(self, "switch_weights") and self.switch_weights:
-            stabilised_terms += f" + {self.switch_weights}"
+            # Assuming switch_weights has attributes for numerator and denominator
+            stabilised_terms.append(self.switch_weights.numerator)
+            stabilised_terms.append(self.switch_weights.denominator)
 
-        return stabilised_terms
+        # Join the terms with ' + ' and return
+        return " + ".join(stabilised_terms)
 
     def update_outcome_formula(self):
         if isinstance(self.outcome_model, TEOutcomeModelUnset) or not self.outcome_model:
@@ -222,6 +235,64 @@ class TrialSequence:
 
         return self
 
+    def calculate_weights(self, quiet: bool = False):
+        """Calculates weights for the trial sequence based on its type."""
+
+        # Check if censor weights are set
+        use_censor_weights = not isinstance(self.censor_weights, TEWeightsUnset)
+
+        # Determine trial type and apply correct weight calculations
+        if isinstance(self, TrialSequenceITT):
+            return calculate_weights_trial_seq(self, quiet, False, use_censor_weights)
+
+        elif isinstance(self, TrialSequenceAT):
+            if isinstance(self.switch_weights, TEWeightsUnset):
+                raise ValueError("Switch weight models are not specified. Use set_switch_weight_model()")
+            return calculate_weights_trial_seq(self, quiet, True, use_censor_weights)
+
+        elif isinstance(self, TrialSequencePP):
+            if isinstance(self.switch_weights, TEWeightsUnset):
+                raise ValueError("Switch weight models are not specified. Use set_switch_weight_model()")
+            return calculate_weights_trial_seq(self, quiet, True, use_censor_weights)
+
+        else:
+            raise TypeError("Unknown trial sequence type.")
+
+    def show_weight_models(self):
+        """Show Weight Model Summaries"""
+        if self.censor_weights is not None:
+            if hasattr(self.censor_weights, 'fitted') and isinstance(self.censor_weights.fitted, dict):
+                print("Weight Models for Informative Censoring")
+                for name, model in self.censor_weights.fitted.items():
+                    print(f"[[{name}]]")
+                    model.show()  # Assuming model has a show method
+
+        if self.switch_weights is not None:
+            if hasattr(self.switch_weights, 'fitted') and isinstance(self.switch_weights.fitted, dict):
+                print("Weight Models for Treatment Switching")
+                for name, model in self.switch_weights.fitted.items():
+                    print(f"[[{name}]]")
+                    model.show()  # Assuming model has a show method
+
+    def set_expansion_options(self, output, chunk_size=0, first_period=0, last_period=float('inf'), censor_at_switch=None):
+        if not isinstance(output, TEDataStore):
+            raise TypeError("Output must be of type te_datastore")
+        if not isinstance(chunk_size, int) or chunk_size < 0:
+            raise ValueError("chunk_size must be a non-negative integer")
+        if first_period != 0 and not isinstance(first_period, int):
+            raise ValueError("first_period must be an integer")
+        if last_period != float('inf') and not isinstance(last_period, int):
+            raise ValueError("last_period must be an integer")
+
+        self.expansion = TEExpansion(
+            chunk_size=chunk_size,
+            datastore=output,
+            first_period=first_period,
+            last_period=last_period,
+            censor_at_switch=censor_at_switch
+        )
+        return self
+
 def trial_sequence(estimand: str = "ITT") -> TrialSequence:
     """Factory function to create a trial sequence with the correct estimand"""
     trial = TrialSequence(estimand=estimand)
@@ -238,11 +309,17 @@ class TrialSequencePP(TrialSequence):
     estimand: str = "Per-protocol"
     switch_weights: TEWeightsSpec = field(default_factory=TEWeightsUnset)
 
+    def set_expansion_options(self, output, chunk_size, first_period=0, last_period=float('inf')):
+        return super().set_expansion_options(output, chunk_size, first_period, last_period, censor_at_switch=True)
+
 
 @dataclass
 class TrialSequenceITT(TrialSequence):
     """Intention-To-Treat Trial Sequence"""
     estimand: str = "Intention-to-treat"
+
+    def set_expansion_options(self, output, chunk_size=0, first_period=0, last_period=float('inf')):
+        return super().set_expansion_options(output, chunk_size, first_period, last_period, censor_at_switch=False)
 
 
 @dataclass

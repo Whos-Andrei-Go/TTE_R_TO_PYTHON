@@ -6,6 +6,11 @@ from scipy.stats import multivariate_normal
 from typing import Optional, Dict, Union
 
 from custom_modules.trialemulation.te_weights import TEWeightsSpec, TEWeightsUnset, TEWeightsFitted
+import re
+
+def sanitize_filename(filename):
+    """Removes invalid characters from filenames."""
+    return re.sub(r'[^\w\-_\.]', '_', filename)  # Keeps letters, numbers, _, -, and .
 
 class TEStatsGLMLogit:
     """Class for fitting logistic regression models using statsmodels."""
@@ -17,20 +22,33 @@ class TEStatsGLMLogit:
 
     def fit_weights_model(self, data: pd.DataFrame, formula: str, label: str):
         """Fits a logistic regression model for weights."""
+        # Fit logistic regression model
         model = sm.formula.glm(formula, data, family=sm.families.Binomial()).fit()
-        
+
+        # Check if the save path exists, if not, create it
         save_path = None
         if self.save_path:
-            save_path = os.path.join(self.save_path, f"model_{label}.pkl")
+            if not os.path.exists(self.save_path):
+                os.makedirs(self.save_path)
+            
+            safe_label = sanitize_filename(label)  # Safe filename for the model
+            save_path = os.path.join(self.save_path, f"model_{safe_label}.pkl")
+            
+            # Save the model
             model.save(save_path)
-
+        
+        # Prepare the summary
         summary = {
             "tidy": model.summary2().tables[1],  # Coefficient details
             "glance": model.summary2().tables[0],  # Model summary
             "save_path": save_path
         }
 
+        # Return the fitted values as part of a TEWeightsFitted object
         return TEWeightsFitted(label, summary, model.fittedvalues)
+
+
+
 
     def fit_outcome_model(self, data: pd.DataFrame, formula: str, weights: Optional[np.ndarray] = None):
         """Fits an outcome model using logistic regression."""
