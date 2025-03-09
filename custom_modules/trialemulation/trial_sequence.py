@@ -277,7 +277,7 @@ class TrialSequence:
                     model.show()  # Assuming model has a show method
 
     def set_expansion_options(self, output, chunk_size=0, first_period=0, last_period=float('inf'), censor_at_switch=None):
-        if not isinstance(output, TEDataStore):
+        if not isinstance(output, TEDatastore):
             raise TypeError("Output must be of type te_datastore")
         if not isinstance(chunk_size, int) or chunk_size < 0:
             raise ValueError("chunk_size must be a non-negative integer")
