@@ -6,6 +6,7 @@ import numpy as np
 from patsy import dmatrices
 from sklearn.linear_model import LogisticRegression
 
+# Datastore doesn't work for some reason???
 from .te_datastore import TEDatastore, TEDatastoreDataTable
 from .te_data import TEData, TEDataUnset, TEOutcomeData
 from .data_manipulation import data_manipulation
