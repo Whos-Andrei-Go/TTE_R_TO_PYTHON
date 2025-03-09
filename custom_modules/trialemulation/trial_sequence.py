@@ -293,6 +293,21 @@ class TrialSequence:
         )
         return self
 
+    def predict(self, newdata, predict_times, conf_int=True, samples=100, type='survival'):
+        # Placeholder for the actual prediction logic
+        # This function should return a DataFrame with the necessary prediction results
+        followup_time = np.arange(0, 11)  # Follow-up times from 0 to 10
+        survival_diff = np.random.rand(len(followup_time))  # Random survival differences
+        lower_bound = survival_diff - 0.1  # 2.5% lower bound
+        upper_bound = survival_diff + 0.1  # 97.5% upper bound
+
+        return pd.DataFrame({
+            'followup_time': followup_time,
+            'survival_diff': survival_diff,
+            '2.5%': lower_bound,
+            '97.5%': upper_bound
+        })
+
 def trial_sequence(estimand: str = "ITT") -> TrialSequence:
     """Factory function to create a trial sequence with the correct estimand"""
     trial = TrialSequence(estimand=estimand)
