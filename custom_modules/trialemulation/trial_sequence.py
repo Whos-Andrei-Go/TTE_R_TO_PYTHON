@@ -1,359 +1,266 @@
+from dataclasses import dataclass, field
+from typing import Optional, Union
+
 import pandas as pd
-import statsmodels.api as sm
-import patsy
+import numpy as np
+from patsy import dmatrices
+from sklearn.linear_model import LogisticRegression
 
-from custom_modules.trialemulation.data_manipulation import data_manipulation
-from custom_modules.trialemulation.te_expansion import TeExpansion, TeExpansionUnset
-from custom_modules.trialemulation.calculate_weights import CalculateWeights
-from custom_modules.trialemulation.model_fitting import stats_glm_logit
-from custom_modules.trialemulation.te_weights import TeWeightsSpec, TeWeightsUnset, TeWeightsFitted
+from .te_data import TEData, TEDataUnset, TEOutcomeData
+from .data_manipulation import data_manipulation
+from .te_weights import TEWeightsSpec, TEWeightsUnset, TEWeightsFitted
+from .te_expansion import TEExpansion, TEExpansionUnset
+from .te_outcome_model import TEOutcomeModel, TEOutcomeModelUnset
+from .censor_func import censor_func
+from .te_stats_glm_logit import TEStatsGLMLogit
+# from .calculate_weights import CalculaTEWeights
 
+@dataclass
 class TrialSequence:
-    def __init__(self, estimand, data=None):
-        self.estimand = estimand
-        self.data = data
-        self.censor_weights = TeWeightsUnset()
-        self.switch_weights = TeWeightsUnset()
-        self.outcome_model = None
-        self.expansion = TeExpansionUnset()
-        self.weights_calculator = CalculateWeights(self)
-
-    def set_expansion_options(self, chunk_size=0, datastore=None, censor_at_switch=False, first_period=0, last_period=float("inf")):
-        self.expansion = TeExpansion(chunk_size, datastore, censor_at_switch, first_period, last_period)
-
-    def set_data(self, data, id_col='id', period_col='period', treatment_col='treatment', outcome_col='outcome', eligible_col='eligible'):
-        self.data = data.rename(columns={
-            id_col: 'id',
-            period_col: 'period',
-            treatment_col: 'treatment',
-            outcome_col: 'outcome',
-            eligible_col: 'eligible'
-        })
-
-        self.data = data_manipulation(data)
-
-    def set_censor_weight_model(self, censor_event, numerator=None, denominator=None, pool_models="none", model_fitter=None):
-        """Set up the censor weight model using logistic regression."""
-
-        if self.data is None:
-            raise ValueError("Please use set_data() before setting the censor weight model.")
-
-        # Default formulas if missing (`~1` in R means no covariates)
-        numerator = f"1 - {censor_event} ~ {numerator.lstrip('~')}" if numerator else f"1 - {censor_event} ~ 1"
-        denominator = f"1 - {censor_event} ~ {denominator.lstrip('~')}" if denominator else f"1 - {censor_event} ~ 1"
-
-        # Validate formulas using `patsy`
-        try:
-            patsy.dmatrices(numerator, self.data)
-            patsy.dmatrices(denominator, self.data)
-        except Exception as e:
-            raise ValueError(f"Invalid formula: {e}")
-
-        # Ensure model_fitter is provided
-        if model_fitter is None:
-            model_fitter = stats_glm_logit()
-
-        # Store the censor weight specification using `TeWeightsSpec`
-        self.censor_weights = TeWeightsSpec(
-            numerator=numerator,
-            denominator=denominator,
-            pool_numerator=pool_models in ["numerator", "both"],
-            pool_denominator=pool_models == "both",
-            model_fitter=model_fitter
-        )
-
-        # Call update_outcome_formula (implement separately if needed)
-        self.update_outcome_formula()
-
-        return self  # Enable method chaining
-
-
-    def set_switch_weight_model(self, numerator=None, denominator=None, model_fitter=None):
-        """Set up the switch weight model using a provided model fitter."""
-
-        if self.data is None:
-            raise ValueError("Please use set_data() before setting switch weight models.")
-
-        if model_fitter is None:
-            raise ValueError("A model_fitter must be provided (e.g., stats_glm_logit()).")
-
-        # Default formulas if missing (`~1` in R means no covariates)
-        numerator = f"treatment ~ {numerator}" if numerator else "treatment ~ 1"
-        denominator = f"treatment ~ {denominator}" if denominator else "treatment ~ 1"
-
-        # Validate formulas using `patsy`
-        try:
-            patsy.dmatrices(numerator, self.data)
-            patsy.dmatrices(denominator, self.data)
-        except Exception as e:
-            raise ValueError(f"Invalid formula: {e}")
-
-        # Store the switch weight specification using `TeWeightsSpec`
-        self.switch_weights = TeWeightsSpec(
-            numerator=numerator,
-            denominator=denominator,
-            pool_numerator=False,  # Default behavior
-            pool_denominator=False,
-            model_fitter=model_fitter
-        )
-
-        return self  # Enable method chaining
-
-
-    def set_outcome_model(self, treatment_var=None, adjustment_terms="1", followup_time_terms="followup_time + I(followup_time**2)", trial_period_terms="trial_period + I(trial_period**2)", model_fitter=None):
-        """Set up the outcome model for the trial sequence."""
-
-        # Ensure data is set
-        if self.data is None:
-            raise ValueError("Use set_data() before calling set_outcome_model().")
-
-        # Default treatment variable if not specified
-        if treatment_var is None:
-            treatment_var = "treatment"  # Default for general case
-
-        # Default model fitter
-        if model_fitter is None:
-            model_fitter = stats_glm_logit()
-
-        # Validate formulas using patsy
-        try:
-            patsy.dmatrices(f"{treatment_var} ~ {adjustment_terms}", self.data)
-            patsy.dmatrices(f"{followup_time_terms}", self.data)
-            patsy.dmatrices(f"{trial_period_terms}", self.data)
-        except Exception as e:
-            raise ValueError(f"Invalid formula: {e}")
-
-        # Extract variables from formulas
-        treatment_vars = patsy.ModelDesc.from_formula(f"{treatment_var} ~ {adjustment_terms}").lhs_termlist
-        adjustment_vars = list(patsy.dmatrix(adjustment_terms, self.data, return_type="dataframe").columns)
-
-        # Store the outcome model
-        self.outcome_model = {
-            "treatment_var": treatment_vars, 
-            "adjustment_vars": adjustment_vars,
-            "model_fitter": model_fitter,
-            "adjustment_terms": adjustment_terms,
-            "treatment_terms": treatment_var,
-            "followup_time_terms": followup_time_terms,
-            "trial_period_terms": trial_period_terms
-        }
-
-        # Update outcome formula if needed
-        self.update_outcome_formula()
-
-        return self  # Enable method chaining
-
-
-    def calculate_weights(self, quiet=False):
-        """Calculate weights for the trial sequence."""
-        if self.data is None:
-            raise ValueError("Data must be set before calculating weights.")
-
-        # Create weights calculator if not already present
-        if not hasattr(self, "weights_calculator") or self.weights_calculator is None:
-            self.weights_calculator = CalculateWeights(self)
-
-        # Call weight calculation logic
-        return self.weights_calculator.calculate_weights_trial_seq(quiet)
-
-
-    def update_outcome_formula(self):
-        """Update the outcome formula after setting censor weights."""
-        if self.censor_weights is None:
-            raise ValueError("Censor weights have not been set.")
-        
-        # Placeholder: Implement outcome formula update logic
-        print("Outcome formula updated based on censor weights.")
-
-        import patsy
-
-    # def update_outcome_formula(self):
-    #     """Update the outcome formula for the trial sequence object."""
-
-    #     if self.outcome_model is None:
-    #         raise ValueError("Outcome model has not been set. Use set_outcome_model() first.")
-
-    #     # Get stabilised weight terms (implement this function separately)
-    #     self.outcome_model["stabilised_weights_terms"] = self.get_stabilised_weights_terms()
-
-    #     # Define the list of formulas
-    #     formula_list = [
-    #         "1",  # Intercept-only formula (~1 in R)
-    #         self.outcome_model["treatment_terms"],
-    #         self.outcome_model["adjustment_terms"],
-    #         self.outcome_model["followup_time_terms"],
-    #         self.outcome_model["trial_period_terms"],
-    #         self.outcome_model["stabilised_weights_terms"]
-    #     ]
-
-    #     # Keep only non-empty formulas
-    #     formula_list = [f for f in formula_list if f and f.strip()]
-
-    #     # Construct the final formula: outcome ~ combined_terms
-    #     outcome_formula = "outcome ~ " + " + ".join(formula_list)
-
-    #     # Store the updated formula
-    #     self.outcome_model["formula"] = outcome_formula
-
-    #     # Extract adjustment variables from formulas
-    #     adjustment_vars = list(patsy.dmatrix(self.outcome_model["adjustment_terms"], self.data, return_type="dataframe").columns)
-    #     stabilised_vars = list(patsy.dmatrix(self.outcome_model["stabilised_weights_terms"], self.data, return_type="dataframe").columns)
-
-    #     # Ensure adjustment variables are unique
-    #     self.outcome_model["adjustment_vars"] = list(set(adjustment_vars + stabilised_vars))
-
-    #     return self  # Enable method chaining
-
+    """Base class for trial sequence"""
+    data: TEData = field(default_factory=TEDataUnset)
+    estimand: str = ""
+    expansion: TEExpansion = field(default_factory=TEExpansionUnset)
+    outcome_model: TEOutcomeModel = field(default_factory=TEOutcomeModelUnset)
+    censor_weights: TEWeightsSpec = field(default_factory=TEWeightsUnset)
+    outcome_data: Optional[TEOutcomeData] = None
+    switch_weights: Optional[TEWeightsSpec] = None  # Only used for PP
 
     def show(self):
-        print(f"Trial Sequence Object\nEstimand: {self.estimand}\n")
-
+        """Display trial sequence information"""
+        print("Trial Sequence Object")
+        print(f"Estimand: {self.estimand}\n")
         print("Data:")
-        if hasattr(self.data, "data"):
-            print(self.data.data.head())  # Print first few rows if it's a DataFrame
-        else:
-            print(self.data)
+        print(self.data)
 
-        print("\nIPW for informative censoring:")
-        print(self.censor_weights if self.censor_weights else "Not set")
+        # Only print censor_weights if it's not unset
+        if not isinstance(self.censor_weights, TEWeightsUnset):
+            print("\nIPW for informative censoring:")
+            print(self.censor_weights)
 
-        print("\nOutcome model:")
-        print(self.outcome_model if self.outcome_model else "Not set")
+        # Only print switch_weights if it exists and is meaningful
+        if self.switch_weights and not isinstance(self.switch_weights, TEWeightsUnset):
+            print("\nIPW for treatment switch censoring:")
+            print(self.switch_weights)
 
-        print("\nExpansion options:")
-        print(self.expansion)  # This will now call `TeExpansion.__str__()` or `TeExpansionUnset.__str__()`
-        
-    def show_switch_weights(self):
-        """Display switch weight model details in a formatted way."""
-        if self.switch_weights is None:
-            print("Switch weights have not been set.")
-            return
+        if not isinstance(self.outcome_model, TEOutcomeModelUnset):
+            print(self.expansion)
+            print("\nOutcome model:")
+            print(self.outcome_model)
 
-        # Extract values using dot notation
-        numerator = self.switch_weights.numerator
-        denominator = self.switch_weights.denominator
-        model_fitter = self.switch_weights.model_fitter
+        if hasattr(self.expansion, "datastore") and self.expansion.datastore is not None:
+            if hasattr(self.expansion.datastore, "N") and self.expansion.datastore.N > 0:
+                print(self.outcome_data)
 
-        print(f"  - Numerator formula: {numerator}")  
-        print(f"  - Denominator formula: {denominator}")
-        print(f"  - Model fitter type: {type(model_fitter).__name__}")
+    def set_data(self, data: pd.DataFrame, 
+                 id_col="id", period_col="period", treatment_col="treatment",
+                 outcome_col="outcome", eligible_col="eligible"):
+        """Sets the trial data for the sequence"""
+        required_cols = {id_col, period_col, treatment_col, outcome_col, eligible_col}
 
-        if self.switch_weights.fitted:
-            print("  - View weight model summaries with `show_weight_models()`")
-        else:
-            print("  - Weight models not fitted. Use `calculate_weights()`")
+        if not required_cols.issubset(data.columns):
+            missing_cols = required_cols - set(data.columns)
+            raise ValueError(f"Missing columns: {missing_cols}")
 
+        self.data = data.rename(columns={
+            id_col: "id",
+            period_col: "period",
+            treatment_col: "treatment",
+            outcome_col: "outcome",
+            eligible_col: "eligible"
+        })
 
-    def show_censor_weights(self):
-        """Display censor weight model details in a formatted way."""
-        if self.censor_weights is None:
-            print("Censor weights have not been set.")
-            return
+        self.data = data_manipulation(self.data)
 
-        # Extract values using dot notation
-        numerator = self.censor_weights.numerator
-        denominator = self.censor_weights.denominator
-        pool_numerator = self.censor_weights.pool_numerator
-        pool_denominator = self.censor_weights.pool_denominator
-        model_fitter = self.censor_weights.model_fitter
+        return self  # Returning `self` allows method chaining
 
-        # Print formatted output
-        print(f"  - Numerator formula: {numerator}")
-        print(f"  - Denominator formula: {denominator}")
+    def set_censor_weight_model(self, censor_event: str,
+                                numerator: Optional[str] = None, denominator: Optional[str] = None,
+                                pool_models: str = "none", model_fitter=None):
+        """Sets the censoring weight model"""
 
-        if pool_numerator and pool_denominator:
-            print("  - Both numerator and denominator models are pooled across treatment arms.")
-        elif pool_numerator:
-            print("  - Numerator model is pooled across treatment arms. Denominator model is not pooled.")
-        elif pool_denominator:
-            print("  - Denominator model is pooled across treatment arms. Numerator model is not pooled.")
-        else:
-            print("  - Neither model is pooled.")
+        # Validate inputs
+        if numerator is None:
+            numerator = "1"
+        if denominator is None:
+            denominator = "1"
 
-        print(f"  - Model fitter type: {type(model_fitter).__name__}")  # Print class name
+        if censor_event not in self.data.columns:
+            raise ValueError(f"{censor_event} not found in dataset")
 
-        if self.censor_weights.fitted:
-            print("  - View weight model summaries with `show_weight_models()`")
-        else:
-            print("  - Weight models not fitted. Use `calculate_weights()`")
+        if pool_models not in ["none", "both", "numerator"]:
+            raise ValueError("pool_models must be one of: 'none', 'both', 'numerator'")
 
-    def show_weight_models(self):
-        """Display summaries of the fitted weight models for censoring and switching."""
-        def print_model_section(title, weights):
-            """Helper function to print model summaries."""
-            if not isinstance(weights, TeWeightsSpec) or not weights.fitted:
-                return  # Skip if no fitted models
-            
-            print(f"\n## {title}\n{'-' * len(title)}")
-            for model_name, model_obj in weights.fitted.items():
-                print(f"\n[[{model_name}]]")
-                if isinstance(model_obj, TeWeightsFitted):  # Ensure correct class
-                    model_obj.show()
-                else:
-                    print(f"Unexpected model type: {type(model_obj)}")
+        # Modify formulas
+        numerator_formula = f"(1 - {censor_event}) ~ {numerator}"
+        denominator_formula = f"(1 - {censor_event}) ~ {denominator}"
 
-        # Display censor weight models
-        print_model_section("Weight Models for Informative Censoring", self.censor_weights)
+        # Ensure model_fitter is a valid model fitter instance
+        if model_fitter is None:
+            model_fitter = TEStatsGLMLogit(os.path.join(PP_PATH, "censor_models"))
 
-        # Display switch weight models
-        print_model_section("Weight Models for Treatment Switching", self.switch_weights)
-
-    def __str__(self):
-        return (
-            f"Trial Sequence Object\n"
-            f"Estimand: {self.estimand}\n"
-            f"\nData:\n{self.data if isinstance(self.data, pd.DataFrame) else 'No data set.'}"
-            f"\n\nExpansion Options:\n{self.expansion}"
-            f"\n\nOutcome Model:\n{self.outcome_model}"
-            f"\n\nCensor Weights:\n{self.censor_weights}"
-            f"\n\nOutcome Data:\n{self.outcome_data}"
-        )
-
-    def __repr__(self):
-        return self.__str__()  # Makes sure `repr(trial)` also prints a readable format
-
-
-
-class TrialSequenceITT(TrialSequence):
-    def __init__(self, data=None):
-        super().__init__('Intention-to-treat', data)
-
-    def set_outcome_model(self, adjustment_terms="1", followup_time_terms="followup_time + I(followup_time**2)", trial_period_terms="trial_period + I(trial_period**2)", model_fitter=None):
-        """Set outcome model for ITT (Intention-to-Treat) trial."""
-        return super().set_outcome_model(
-            treatment_var="assigned_treatment",
-            adjustment_terms=adjustment_terms,
-            followup_time_terms=followup_time_terms,
-            trial_period_terms=trial_period_terms,
+        # Store the censoring weights model
+        self.censor_weights = TEWeightsSpec(
+            numerator=numerator_formula,
+            denominator=denominator_formula,
+            pool_numerator=(pool_models in ["numerator", "both"]),
+            pool_denominator=(pool_models == "both"),
             model_fitter=model_fitter
         )
 
+        # Update outcome formula if an outcome model is set
+        if hasattr(self, "outcome_model") and not isinstance(self.outcome_model, TEOutcomeModelUnset):
+            self.update_outcome_formula()
+
+        return self
+
+    def set_switch_weight_model(self, numerator: str, denominator: str, model_fitter, 
+                            eligible_wts_0=None, eligible_wts_1=None, 
+                            pool_numerator=None, pool_denominator=None):
+        """Sets the switching weight model without requiring an outcome model"""
+
+        if isinstance(self, TrialSequenceITT):
+            raise ValueError("Switching weights are not supported for intention-to-treat analyses")
+
+        if isinstance(self.data, TEDataUnset):
+            raise ValueError("Please use set_data() before setting switch weight models")
+
+        # Validate eligibility weight columns
+        data_cols = self.data.columns
+        if eligible_wts_0 and eligible_wts_0 not in data_cols:
+            raise ValueError(f"Column '{eligible_wts_0}' not found in dataset")
+        if eligible_wts_1 and eligible_wts_1 not in data_cols:
+            raise ValueError(f"Column '{eligible_wts_1}' not found in dataset")
+
+        numerator_formula = f"treatment ~ {numerator}"
+        denominator_formula = f"treatment ~ {denominator}"
+
+        # Store the switch weights model
+        self.switch_weights = TEWeightsSpec(
+            numerator=numerator_formula,
+            denominator=denominator_formula,
+            model_fitter=model_fitter,
+            pool_numerator=pool_numerator,
+            pool_denominator=pool_denominator
+        )
+
+        # **Only update the outcome formula if an outcome model exists**
+        if hasattr(self, "outcome_model") and not isinstance(self.outcome_model, TEOutcomeModelUnset):
+            self.update_outcome_formula()
+
+        return self
+
+    def set_outcome_model(self, treatment_var="0", adjustment_terms="1",
+                          followup_time_terms="followup_time + np.power(followup_time, 2)",
+                          trial_period_terms="trial_period + np.power(trial_period, 2)",
+                          model_fitter=None):
+        if self.data is None:
+            raise ValueError("Use set_data() before set_outcome_model()")
+
+        # Create formulas
+        formulas = {
+            "treatment": treatment_var,
+            "adjustment": adjustment_terms,
+            "followup": followup_time_terms,
+            "period": trial_period_terms,
+            "stabilised": self.get_stabilised_weights_terms()
+        }
+
+        # Collect adjustment variables
+        adjustment_vars = set(formulas["adjustment"].split(" + ")) | set(formulas["stabilised"].split(" + "))
+
+        # Validate variables exist in data
+        missing_vars = [var for var in adjustment_vars if var not in self.data.columns]
+        if missing_vars:
+            raise ValueError(f"Missing variables in adjustment terms: {missing_vars}")
+
+        self.outcome_model = {
+            "treatment_var": formulas["treatment"],
+            "adjustment_vars": adjustment_vars,
+            "model_fitter": model_fitter or LogisticRegression(),
+            "adjustment_terms": formulas["adjustment"],
+            "treatment_terms": formulas["treatment"],
+            "followup_time_terms": formulas["followup"],
+            "trial_period_terms": formulas["period"],
+            "stabilised_weights_terms": formulas["stabilised"]
+        }
+
+        self.update_outcome_formula()
+
+    def get_stabilised_weights_terms(self):
+        stabilised_terms = "1"
+
+        if hasattr(self, "censor_weights") and self.censor_weights:
+            stabilised_terms += f" + {self.censor_weights}"
+
+        if hasattr(self, "switch_weights") and self.switch_weights:
+            stabilised_terms += f" + {self.switch_weights}"
+
+        return stabilised_terms
+
+    def update_outcome_formula(self):
+        if isinstance(self.outcome_model, TEOutcomeModelUnset) or not self.outcome_model:
+            raise ValueError("Outcome model is not set. Use set_outcome_model() before proceeding.")
+
+        terms = [
+            "1",
+            self.outcome_model.treatment_terms or "",
+            self.outcome_model.adjustment_terms or "",
+            self.outcome_model.followup_time_terms or "",
+            self.outcome_model.trial_period_terms or "",
+            self.outcome_model.stabilised_weights_terms or ""
+        ]
+
+        # Construct final formula
+        outcome_formula = " + ".join(filter(None, terms))
+        self.outcome_model.formula = f"outcome ~ {outcome_formula}"
+
+        # Update adjustment vars
+        self.outcome_model.adjustment_vars = set(
+            self.outcome_model.adjustment_terms.split(" + ")
+        ) | set(self.outcome_model.stabilised_weights_terms.split(" + "))
+
+        return self
+
+def trial_sequence(estimand: str = "ITT") -> TrialSequence:
+    """Factory function to create a trial sequence with the correct estimand"""
+    trial = TrialSequence(estimand=estimand)
+    
+    if estimand == "PP":
+        trial.switch_weights = TEWeightsUnset()  # Add switch weights for per-protocol
+    
+    return trial
+
+
+@dataclass
 class TrialSequencePP(TrialSequence):
-    def __init__(self, data=None, save_path=None):
-        super().__init__('Per-protocol', data)
-        self.switch_weights = None
+    """Per-Protocol Trial Sequence"""
+    estimand: str = "Per-protocol"
+    switch_weights: TEWeightsSpec = field(default_factory=TEWeightsUnset)
 
-    def set_outcome_model(self, adjustment_terms="1", followup_time_terms="followup_time + I(followup_time**2)", trial_period_terms="trial_period + I(trial_period**2)", model_fitter=None):
-        """Set outcome model for PP (Per-Protocol) trial."""
-        return super().set_outcome_model(
-            treatment_var="assigned_treatment",
-            adjustment_terms=adjustment_terms,
-            followup_time_terms=followup_time_terms,
-            trial_period_terms=trial_period_terms,
-            model_fitter=model_fitter
-        )
 
+@dataclass
+class TrialSequenceITT(TrialSequence):
+    """Intention-To-Treat Trial Sequence"""
+    estimand: str = "Intention-to-treat"
+
+
+@dataclass
 class TrialSequenceAT(TrialSequence):
-    def __init__(self, data=None):
-        super().__init__('As treated', data)
-        self.switch_weights = None
+    """As-Treated Trial Sequence"""
+    estimand: str = "As treated"
+    switch_weights: TEWeightsSpec = field(default_factory=TEWeightsUnset)
 
-    def set_outcome_model(self, treatment_var="dose", adjustment_terms="1", followup_time_terms="followup_time + I(followup_time**2)", trial_period_terms="trial_period + I(trial_period**2)", model_fitter=None):
-        """Set outcome model for AT (As-Treated) trial."""
-        return super().set_outcome_model(
-            treatment_var=treatment_var,
-            adjustment_terms=adjustment_terms,
-            followup_time_terms=followup_time_terms,
-            trial_period_terms=trial_period_terms,
-            model_fitter=model_fitter
-        )
+
+def trial_sequence(estimand: str, **kwargs) -> TrialSequence:
+    """Factory function for creating trial sequence objects"""
+    estimand_classes = {
+        "ITT": TrialSequenceITT,
+        "PP": TrialSequencePP,
+        "AT": TrialSequenceAT
+    }
+
+    if estimand in estimand_classes:
+        return estimand_classes[estimand](**kwargs)
+    else:
+        raise ValueError(f"{estimand} does not extend class TrialSequence")

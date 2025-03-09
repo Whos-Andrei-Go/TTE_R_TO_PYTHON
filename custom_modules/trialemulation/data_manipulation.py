@@ -1,59 +1,91 @@
 import pandas as pd
 import numpy as np
 
+from .censor_func import censor_func
+
 def data_manipulation(data: pd.DataFrame, use_censor: bool = True) -> pd.DataFrame:
-    """Preprocess data for weight calculation and treatment extension."""
-    
-    # Ensure required columns exist
-    required_columns = {"id", "period", "treatment", "outcome", "eligible"}
-    missing_columns = required_columns - set(data.columns)
-    if missing_columns:
-        raise ValueError(f"Missing required columns: {missing_columns}")
+    """
+    Preprocesses the data for weight calculation and extension.
 
-    # Remove observations before eligibility
-    eligible_min_period = data.loc[data["eligible"] == 1, "period"].min()
-    data["after_eligibility"] = data["period"] >= eligible_min_period if not pd.isna(eligible_min_period) else True
+    Parameters:
+    - data: pandas DataFrame containing the data.
+    - use_censor: Whether to apply censoring due to treatment switch.
 
-    if data["after_eligibility"].eq(False).any():
-        print("Warning: Observations before trial eligibility were removed.")
-    data = data[data["after_eligibility"]].drop(columns=["after_eligibility"])
+    Returns:
+    - Preprocessed DataFrame.
+    """
+    # Ensure 'id' and 'period' are sorted for correct group operations
+    data = data.sort_values(by=["id", "period"]).copy()
+
+    # Remove observations before trial eligibility
+    data["after_eligibility"] = data.groupby("id")["period"].transform(lambda x: x >= x[data["eligible"] == 1].min() if (data["eligible"] == 1).any() else False)
+    if not data["after_eligibility"].all():
+        print("Warning: Observations before trial eligibility were removed")
+        data = data[data["after_eligibility"]]
+
+    data.drop(columns=["after_eligibility"], inplace=True)
 
     # Remove observations after the outcome event
-    data["after_event"] = data.groupby("id")["period"].transform(
-        lambda x: x > x[data["outcome"] == 1].min() if (data["outcome"] == 1).any() else False
-    )
-    if data["after_event"].eq(True).any():
-        print("Warning: Observations after the outcome occurred were removed.")
-    data = data[~data["after_event"]].drop(columns=["after_event"])
+    data["after_event"] = data.groupby("id")["period"].transform(lambda x: x > x[data["outcome"] == 1].min() if (data["outcome"] == 1).any() else False)
+    if data["after_event"].any():
+        print("Warning: Observations after the outcome occurred were removed")
+        data = data[~data["after_event"]]
 
-    # Calculate time_of_event (9999 if no event occurred)
-    data["time_of_event"] = data.groupby("id")["outcome"].transform(
-        lambda x: x.idxmax() if x.max() == 1 else 9999
-    )
+    data.drop(columns=["after_event"], inplace=True)
 
-    # Compute treatment switch tracking
-    data["am_1"] = data.groupby("id")["treatment"].shift(fill_value=0)  # Lagged treatment
-    data["switch"] = (data["am_1"] != data["treatment"]).astype(int)
+    # Calculate event time
+    event_data = data.groupby("id").last()[["period", "outcome"]].reset_index()
+    event_data["time_of_event"] = np.where(event_data["outcome"] == 1, event_data["period"].astype(float), 9999)
 
-    # Compute regime start (reset when switching occurs)
-    data["regime_start"] = np.where(data["switch"] == 1, data["period"], np.nan)
-    data["regime_start"] = data.groupby("id")["regime_start"].ffill()
-    data["regime_start"] = data["regime_start"].fillna(data["period"])  # ✅ FIXED
+    # Merge event data
+    sw_data = data.merge(event_data[["id", "time_of_event"]], on="id", how="left")
 
-    # Compute time_on_regime (reset at switches)
-    data["time_on_regime"] = data["period"] - data.groupby("id")["regime_start"].shift(fill_value=data["period"].min())
+    # Define first occurrence in each group
+    sw_data["first"] = ~sw_data["id"].duplicated(keep="first")
 
-    # Compute cumulative treatment duration
-    data["cumA"] = data.groupby("id")["treatment"].cumsum()
+    # Lagged treatment
+    sw_data["am_1"] = sw_data.groupby("id")["treatment"].shift(1, fill_value=0)
+
+    # Initialize cumulative treatment, switching, and regime tracking
+    sw_data["cumA"] = 0
+    sw_data["switch"] = 0
+    sw_data["regime_start"] = sw_data["period"]
+    sw_data["time_on_regime"] = 0
+
+    # Update based on treatment changes
+    mask_not_first = ~sw_data["first"]
+    sw_data.loc[mask_not_first & (sw_data["am_1"] != sw_data["treatment"]), "switch"] = 1
+    sw_data.loc[mask_not_first & (sw_data["am_1"] == sw_data["treatment"]), "switch"] = 0
+
+    sw_data.loc[mask_not_first & (sw_data["switch"] == 1), "regime_start"] = sw_data["period"]
+    sw_data["regime_start"] = sw_data.groupby("id")["regime_start"].ffill()
+
+    # Compute time on regime
+    sw_data["regime_start_shift"] = sw_data.groupby("id")["regime_start"].shift(1)
+    sw_data.loc[mask_not_first, "time_on_regime"] = sw_data["period"] - sw_data["regime_start_shift"].astype(float)
+    sw_data.drop(columns=["regime_start_shift"], inplace=True)
+
+    # Cumulative treatment assignment
+    sw_data["cumA"] = sw_data.groupby("id")["treatment"].cumsum()
 
     # Apply censoring if required
     if use_censor:
-        # Placeholder for censoring logic, similar to censor_func in R
-        data["delete"] = False  # Modify based on actual censoring conditions
-        data = data[~data["delete"]].drop(columns=["delete"])
+        sw_data["started0"] = np.nan
+        sw_data["started1"] = np.nan
+        sw_data["stop0"] = np.nan
+        sw_data["stop1"] = np.nan
+        sw_data["eligible0_sw"] = np.nan
+        sw_data["eligible1_sw"] = np.nan
+        sw_data["delete"] = np.nan
 
-    # Define eligibility for different treatment paths
-    data["eligible0"] = (data["am_1"] == 0).astype(int)
-    data["eligible1"] = (data["am_1"] == 1).astype(int)
+        sw_data = censor_func(sw_data)  # Assuming censor_func is implemented elsewhere
 
-    return data
+        # Remove censored observations
+        sw_data = sw_data[sw_data["delete"] == False]
+        sw_data.drop(columns=["delete", "eligible0_sw", "eligible1_sw", "started0", "started1", "stop0", "stop1"], inplace=True)
+
+    # Define eligibility indicators
+    sw_data["eligible0"] = (sw_data["am_1"] == 0).astype(int)
+    sw_data["eligible1"] = (sw_data["am_1"] == 1).astype(int)
+
+    return sw_data

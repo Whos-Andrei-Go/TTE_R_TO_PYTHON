@@ -1,122 +1,106 @@
-import numpy as np
-import pandas as pd
-import patsy
-
 from custom_modules.trialemulation.te_weights import TeWeightsSpec, TeWeightsUnset, TeWeightsFitted
 
-class CalculateWeights:
-    """Handles calculation of inverse probability of censoring and switching weights."""
+import pandas as pd
+import numpy as np
 
-    def __init__(self, trial_sequence):
-        """Initialize with a TrialSequence object."""
-        self.trial_sequence = trial_sequence
+def calculate_weights_trial_seq(obj, switch_weights=True, censor_weights=True):
+    """Calculate weights for a trial sequence"""
+    obj.data["wt"] = 1
 
-    def calculate_weights_trial_seq(self, quiet=False, switch_weights=True, censor_weights=True):
-        """Calculate weights for the trial sequence."""
-        ts = self.trial_sequence
+    if switch_weights and not isinstance(obj.switch_weights, TeWeightsUnset):
+        obj = calculate_switch_weights(obj)
+        obj.data["wt"] *= obj.data["wtS"]
 
-        if ts.data is None:
-            raise ValueError("Data must be set before calculating weights.")
+    if censor_weights and not isinstance(obj.censor_weights, TeWeightsUnset):
+        obj = calculate_censor_weights(obj)
+        obj.data["wt"] *= obj.data["wtC"]
 
-        ts.data["wt"] = 1  # Initialize weights to 1
+    return obj
 
-        if switch_weights and isinstance(ts.switch_weights, TeWeightsSpec):
-            self.calculate_switch_weights()
-            ts.data["wt"] *= ts.data["wtS"]
 
-        if censor_weights and isinstance(ts.censor_weights, TeWeightsSpec):
-            self.calculate_censor_weights()
-            ts.data["wt"] *= ts.data["wtC"]
+def calculate_switch_weights(obj):
+    """Calculate treatment switching weights"""
+    data = obj.data
 
-        if not quiet:
-            print("Weights calculated successfully.")
+    if "eligible_wts_1" in data.columns:
+        data_1_expr = (data["am_1"] == 1) & (data["eligible_wts_1"] == 1)
+    else:
+        data_1_expr = data["am_1"] == 1
 
-        return ts
+    model_1_index = data.index[data_1_expr]
 
-    def calculate_switch_weights(self):
-        """Calculate switch weights using logistic regression models."""
-        ts = self.trial_sequence
+    obj.switch_weights.fitted["n1"] = fit_weights_model(
+        data.loc[model_1_index], obj.switch_weights.numerator,
+        "P(treatment = 1 | previous treatment = 1) for numerator"
+    )
+    data.loc[model_1_index, "p_n"] = obj.switch_weights.fitted["n1"].fitted
 
-        if ts.switch_weights is None or ts.switch_weights.model_fitter is None:
-            raise ValueError("Switch weight model fitter is missing. Did you call set_switch_weight_model()?")
+    obj.switch_weights.fitted["d1"] = fit_weights_model(
+        data.loc[model_1_index], obj.switch_weights.denominator,
+        "P(treatment = 1 | previous treatment = 1) for denominator"
+    )
+    data.loc[model_1_index, "p_d"] = obj.switch_weights.fitted["d1"].fitted
 
-        ts.data["p_n"] = np.nan
-        ts.data["p_d"] = np.nan
-        ts.switch_weights.fitted = {}
+    # Repeat for Treatment = 0
+    if "eligible_wts_1" in data.columns:
+        data_0_expr = (data["am_1"] == 0) & (data["eligible_wts_1"] == 0)
+    else:
+        data_0_expr = data["am_1"] == 0
 
-        # Fit numerator model
-        model_1_index = ts.data.query("am_1 == 1").index
-        fitted_n1 = ts.switch_weights.model_fitter.fit_weights_model(ts.data.loc[model_1_index], ts.switch_weights.numerator)
-        
-        ts.switch_weights.fitted["n1"] = TeWeightsFitted(
-            label="P(treatment = 1 | previous treatment = 1) for numerator",
-            summary=fitted_n1["summary"],
-            fitted_model=fitted_n1["model"],
-            save_path=fitted_n1.get("save_path")
+    model_0_index = data.index[data_0_expr]
+
+    obj.switch_weights.fitted["n0"] = fit_weights_model(
+        data.loc[model_0_index], obj.switch_weights.numerator,
+        "P(treatment = 1 | previous treatment = 0) for numerator"
+    )
+    data.loc[model_0_index, "p_n"] = obj.switch_weights.fitted["n0"].fitted
+
+    obj.switch_weights.fitted["d0"] = fit_weights_model(
+        data.loc[model_0_index], obj.switch_weights.denominator,
+        "P(treatment = 1 | previous treatment = 0) for denominator"
+    )
+    data.loc[model_0_index, "p_d"] = obj.switch_weights.fitted["d0"].fitted
+
+    # Combine Weights
+    data["wtS"] = 1.0
+    mask_0 = (data["treatment"] == 0)
+    mask_1 = (data["treatment"] == 1)
+    
+    data.loc[mask_0, "wtS"] = (1.0 - data["p_n"]) / (1.0 - data["p_d"])
+    data.loc[mask_1, "wtS"] = data["p_n"] / data["p_d"]
+    data["wtS"].fillna(1, inplace=True)
+
+    return obj
+
+
+
+def calculate_censor_weights(obj):
+    """Calculate censoring weights"""
+    data = obj.data
+
+    if obj.censor_weights.pool_numerator:
+        obj.censor_weights.fitted["n"] = fit_weights_model(
+            data, obj.censor_weights.numerator, "P(censor_event = 0 | X) for numerator"
         )
-        
-        ts.data.loc[model_1_index, "p_n"] = fitted_n1["model"].predict(ts.data.loc[model_1_index])
+        data["pC_n"] = obj.censor_weights.fitted["n"].fitted
+    else:
+        mask_0 = data["am_1"] == 0
+        mask_1 = data["am_1"] == 1
 
-        # Fit denominator model
-        fitted_d1 = ts.switch_weights.model_fitter.fit_weights_model(ts.data.loc[model_1_index], ts.switch_weights.denominator)
-        
-        ts.switch_weights.fitted["d1"] = TeWeightsFitted(
-            label="P(treatment = 1 | previous treatment = 1) for denominator",
-            summary=fitted_d1["summary"],
-            fitted_model=fitted_d1["model"],
-            save_path=fitted_d1.get("save_path")
+        obj.censor_weights.fitted["n0"] = fit_weights_model(
+            data[mask_0], obj.censor_weights.numerator,
+            "P(censor_event = 0 | X, previous treatment = 0) for numerator"
         )
+        data.loc[mask_0, "pC_n"] = obj.censor_weights.fitted["n0"].fitted
 
-        ts.data.loc[model_1_index, "p_d"] = fitted_d1["model"].predict(ts.data.loc[model_1_index])
-
-        # Compute switch weights (wtS)
-        ts.data["wtS"] = np.where(
-            ts.data["treatment"] == 0,  
-            (1.0 - ts.data["p_n"]) / (1.0 - ts.data["p_d"]),  
-            ts.data["p_n"] / ts.data["p_d"]
+        obj.censor_weights.fitted["n1"] = fit_weights_model(
+            data[mask_1], obj.censor_weights.numerator,
+            "P(censor_event = 0 | X, previous treatment = 1) for numerator"
         )
+        data.loc[mask_1, "pC_n"] = obj.censor_weights.fitted["n1"].fitted
 
-        # Ensure there are no NaN values in `wtS`
-        ts.data["wtS"] = ts.data["wtS"].fillna(1)
+    data["pC_d"].fillna(1, inplace=True)
+    data["pC_n"].fillna(1, inplace=True)
+    data["wtC"] = data["pC_n"] / data["pC_d"]
 
-
-    def calculate_censor_weights(self):
-        """Calculate censoring weights using logistic regression models."""
-        ts = self.trial_sequence
-
-        if ts.censor_weights is None:
-            raise ValueError("Censor weights have not been set.")
-
-        ts.data["pC_n"] = np.nan
-        ts.data["pC_d"] = np.nan
-
-        elig_0_index = ts.data.query("am_1 == 0").index
-        elig_1_index = ts.data.query("am_1 == 1").index
-
-        # Fit numerator model
-        ts.censor_weights.fitted = {}
-
-        ts.censor_weights.fitted["n0"] = ts.censor_weights.model_fitter.fit_weights_model(
-            ts.data.loc[elig_0_index], ts.censor_weights.numerator
-        )
-        ts.data.loc[elig_0_index, "pC_n"] = ts.censor_weights.fitted["n0"]["model"].predict(ts.data.loc[elig_0_index])
-
-        ts.censor_weights.fitted["n1"] = ts.censor_weights.model_fitter.fit_weights_model(
-            ts.data.loc[elig_1_index], ts.censor_weights.numerator
-        )
-        ts.data.loc[elig_1_index, "pC_n"] = ts.censor_weights.fitted["n1"]["model"].predict(ts.data.loc[elig_1_index])
-
-        # Fit denominator model
-        ts.censor_weights.fitted["d0"] = ts.censor_weights.model_fitter.fit_weights_model(
-            ts.data.loc[elig_0_index], ts.censor_weights.denominator
-        )
-        ts.data.loc[elig_0_index, "pC_d"] = ts.censor_weights.fitted["d0"]["model"].predict(ts.data.loc[elig_0_index])
-
-        ts.censor_weights.fitted["d1"] = ts.censor_weights.model_fitter.fit_weights_model(
-            ts.data.loc[elig_1_index], ts.censor_weights.denominator
-        )
-        ts.data.loc[elig_1_index, "pC_d"] = ts.censor_weights.fitted["d1"]["model"].predict(ts.data.loc[elig_1_index])
-
-        # Compute censor weights
-        ts.data["wtC"] = ts.data["pC_n"] / ts.data["pC_d"]
-        ts.data["wtC"] = ts.data["wtC"].fillna(1)
+    return obj
