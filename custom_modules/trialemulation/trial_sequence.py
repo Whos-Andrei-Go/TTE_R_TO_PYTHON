@@ -1,5 +1,6 @@
 import pandas as pd
 import statsmodels.api as sm
+from custom_modules.trialemulation.data_manipulation import data_manipulation
 from custom_modules.trialemulation.te_expansion import TeExpansion, TeExpansionUnset
 
 class TrialSequence:
@@ -22,7 +23,8 @@ class TrialSequence:
             outcome_col: 'outcome',
             eligible_col: 'eligible'
         })
-        self.data["time_on_regime"] = self.data.groupby("id")["treatment"].cumsum()
+
+        self.data = data_manipulation(data)
 
     def set_censor_weight_model(self, censor_event, numerator_formula, denominator_formula):
         self.censor_weights = {'censor_event': censor_event, 'numerator': numerator_formula, 'denominator': denominator_formula}
